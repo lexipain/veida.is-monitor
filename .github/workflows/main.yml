@@ -1,0 +1,51 @@
+name: veida-monitor
+
+# Runs in the cloud on a schedule — no machine of yours needs to be on.
+on:
+  schedule:
+    # Every 2 hours. Cron is UTC. Adjust as you like (e.g. "0 */3 * * *" = every 3h).
+    # Note: GitHub may delay scheduled runs by several minutes under load.
+    - cron: "0 */2 * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write          # needed to commit the state file back to the repo
+
+concurrency:
+  group: veida-monitor     # don't overlap runs
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests beautifulsoup4
+
+      - name: Run monitor
+        env:
+          MONITOR_MONTHS: "juni,juli"
+          # Gmail SMTP. Add these as repo secrets:
+          #   Settings -> Secrets and variables -> Actions -> New repository secret
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "587"
+          SMTP_USER: ${{ secrets.SMTP_USER }}   # your.address@gmail.com
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}   # 16-char Gmail App Password
+          EMAIL_FROM: ${{ secrets.SMTP_USER }}
+          EMAIL_TO: ${{ secrets.SMTP_USER }}    # self-email; change to send elsewhere
+        run: python veida_monitor.py
+
+      - name: Persist state (so you aren't re-emailed every run)
+        run: |
+          if [[ -n "$(git status --porcelain veida_state.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add veida_state.json
+            git commit -m "update availability state [skip ci]"
+            git push
+          fi
