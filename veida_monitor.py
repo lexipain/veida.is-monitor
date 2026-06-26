@@ -31,6 +31,8 @@ Exit code is 0 normally, 2 if a fetch/parse error occurred (useful for CI alerti
 import os
 import re
 import sys
+import gzip
+import zlib
 import json
 import smtplib
 import unicodedata
@@ -72,7 +74,13 @@ HEADERS = {
         "image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "is,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",   # 'br' requires: pip install brotli
+    # 'br' (Brotli) deliberately NOT advertised: requests only decodes Brotli when
+    # the 'brotli' package is installed, and an undecoded br response is the usual
+    # cause of binary-garbage output. gzip/deflate are always decodable by the
+    # standard library. (fetch_html still recovers br if a server forces it and
+    # brotli happens to be importable.) This change does NOT affect the 415 — that
+    # was the Accept / User-Agent headers, not Accept-Encoding.
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
@@ -108,31 +116,81 @@ def fetch_html(url: str) -> str:
         print(f"[debug] status={resp.status_code} "
               f"content-encoding={resp.headers.get('Content-Encoding')!r} "
               f"len={len(text)}", file=sys.stderr)
-        print(f"[debug] first 300 chars: {text[:300]!r}", file=sys.stderr)
+        print(f"[debug] first 200 chars: {text[:200]!r}", file=sys.stderr)
 
-    # Guard against undecoded Brotli: if real HTML never has a '<' in the first
-    # kilobyte, we almost certainly got compressed bytes back.
-    if "<" not in text[:1000]:
-        enc = (resp.headers.get("Content-Encoding") or "").lower()
-        if "br" in enc:
-            try:
-                import brotli  # pip install brotli
-                text = brotli.decompress(resp.content).decode(
-                    resp.encoding or "utf-8", "replace"
-                )
-            except ImportError as exc:
-                raise RuntimeError(
-                    "Server returned Brotli-compressed content but the 'brotli' "
-                    "package isn't installed, so requests couldn't decode it. "
-                    "Fix with: pip install brotli  (or drop 'br' from "
-                    "HEADERS['Accept-Encoding'])."
-                ) from exc
-        else:
-            raise RuntimeError(
-                f"Response doesn't look like HTML (Content-Encoding="
-                f"{enc or 'none'!r}, len={len(text)}). First chars: {text[:200]!r}"
-            )
-    return text
+    # Fast path: requests already handed us decoded HTML.
+    if _looks_like_html(text):
+        return text
+
+    # Otherwise the body is still compressed (requests couldn't decode the
+    # Content-Encoding). Decompress the raw bytes ourselves.
+    enc = resp.headers.get("Content-Encoding") or ""
+    decoded = _manual_decompress(resp.content, enc)
+    if decoded is not None:
+        recovered = decoded.decode(resp.encoding or "utf-8", "replace")
+        if _looks_like_html(recovered):
+            if DEBUG:
+                print(f"[debug] manually decompressed via Content-Encoding="
+                      f"{enc!r}", file=sys.stderr)
+            return recovered
+
+    # Still no usable HTML — explain precisely what's wrong.
+    hint = ""
+    if "br" in enc.lower():
+        try:
+            import brotli  # noqa: F401
+        except ImportError:
+            hint = (" The response is Brotli-encoded but the 'brotli' package "
+                    "isn't importable in THIS Python environment. Either run "
+                    "`pip install brotli` for the same interpreter that runs this "
+                    "script, or keep Accept-Encoding as 'gzip, deflate'.")
+    raise RuntimeError(
+        f"Response isn't decodable HTML (Content-Encoding={enc or 'none'!r}, "
+        f"{len(resp.content)} raw bytes).{hint}"
+    )
+
+
+# Multi-character HTML tokens — unlike a lone '<', these effectively never occur
+# in random/compressed binary, so they reliably distinguish HTML from garbage.
+_HTML_MARKERS = (
+    "<!doctype", "<html", "<head", "<body", "<table",
+    "<div", "<meta", "<span", "<script", "<a ",
+)
+
+
+def _looks_like_html(s: str) -> bool:
+    head = s[:8192].lower()
+    return any(tok in head for tok in _HTML_MARKERS)
+
+
+def _manual_decompress(raw: bytes, content_encoding: str):
+    """
+    Decompress raw bytes, trying the declared Content-Encoding first, then every
+    other method as a fallback (servers sometimes send an encoding they didn't
+    advertise, or label it wrong). Returns bytes, or None if nothing worked.
+    """
+    enc = (content_encoding or "").lower()
+    order = [m for m in ("br", "gzip", "deflate") if m in enc]
+    order += [m for m in ("br", "gzip", "deflate") if m not in order]
+
+    for method in order:
+        try:
+            if method == "br":
+                try:
+                    import brotli
+                except ImportError:
+                    continue
+                return brotli.decompress(raw)
+            if method == "gzip":
+                return gzip.decompress(raw)
+            if method == "deflate":
+                try:
+                    return zlib.decompress(raw)               # zlib-wrapped
+                except zlib.error:
+                    return zlib.decompress(raw, -zlib.MAX_WBITS)  # raw deflate
+        except Exception:
+            continue
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -314,10 +372,10 @@ def save_state(keys):
 # Email notification
 # --------------------------------------------------------------------------- #
 def send_email(new_rows):
-    lines = ["Veidileyfi laust!\n"]
+    lines = ["Veidileyfi laust! (a fishing permit is available)\n"]
     for r in new_rows:
         lines.append(f"- {r['name']} - {r['status']} - {r['price']}\n  {r['url']}")
-    lines.append("\nBóka hér: " + URL)
+    lines.append("\nBook here: " + URL)
     body = "\n".join(lines)
 
     user = os.environ["SMTP_USER"]
