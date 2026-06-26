@@ -53,7 +53,7 @@ URL = os.environ.get(
 # júní -> "juni", júlí -> "juli", ágúst -> "agust", etc.
 WATCH_MONTHS = {
     m.strip().lower()
-    for m in os.environ.get("MONITOR_MONTHS", "juni,juli,september").split(",")
+    for m in os.environ.get("MONITOR_MONTHS", "juni,juli").split(",")
     if m.strip()
 }
 
@@ -61,6 +61,10 @@ STATE_FILE = os.environ.get("MONITOR_STATE_FILE", "veida_state.json")
 
 # Set MONITOR_DEBUG=1 to print what was actually received (encoding, length, snippet).
 DEBUG = os.environ.get("MONITOR_DEBUG", "").strip() not in ("", "0", "false", "False")
+
+# Set MONITOR_NO_EMAIL=1 to run detection + state-save WITHOUT sending email.
+# Useful for testing that rows are matched and the JSON file is written.
+NO_EMAIL = os.environ.get("MONITOR_NO_EMAIL", "").strip() not in ("", "0", "false", "False")
 
 # Browser-identical headers. The Accept / User-Agent values are what get you past
 # the WAF (the server returns 415 without them); keep them as-is.
@@ -418,7 +422,18 @@ def main():
 
     if new_keys:
         new_rows = [r for r in available if r["url"] in new_keys]
-        send_email(new_rows)
+        if NO_EMAIL:
+            print(f"[info] MONITOR_NO_EMAIL set - not sending; would notify about "
+                  f"{len(new_rows)} item(s)", file=sys.stderr)
+        else:
+            try:
+                send_email(new_rows)
+            except Exception as e:
+                # Email failed. Do NOT record these as seen, so the next run
+                # retries them. State is left untouched on purpose.
+                print(f"[error] email failed - state NOT updated so it retries "
+                      f"next run: {e}", file=sys.stderr)
+                return 2
 
     save_state(current_keys)
     return 0
