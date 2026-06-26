@@ -53,7 +53,7 @@ URL = os.environ.get(
 # júní -> "juni", júlí -> "juli", ágúst -> "agust", etc.
 WATCH_MONTHS = {
     m.strip().lower()
-    for m in os.environ.get("MONITOR_MONTHS", "juni,juli").split(",")
+    for m in os.environ.get("MONITOR_MONTHS", "juni,juli,september").split(",")
     if m.strip()
 }
 
