@@ -10,6 +10,13 @@ month matches and whose status ("Staða") indicates stock is available
 A small JSON state file means you're only emailed when something NEW becomes
 available, not on every run.
 
+NOTE ON COMPRESSION:
+  The request advertises Brotli ("Accept-Encoding: ... br"). requests/urllib3 will
+  only DECODE Brotli if the 'brotli' package is installed. If it isn't, resp.text is
+  undecoded binary and parsing silently fails. Install it once with:
+        pip install brotli
+  (fetch_html() below also detects this case and raises a clear error.)
+
 Required environment variables (Gmail example):
   SMTP_HOST   smtp.gmail.com        (default)
   SMTP_PORT   587                   (default)
@@ -44,17 +51,17 @@ URL = os.environ.get(
 # júní -> "juni", júlí -> "juli", ágúst -> "agust", etc.
 WATCH_MONTHS = {
     m.strip().lower()
-    for m in os.environ.get("MONITOR_MONTHS", "juni,juli").split(",")
+    for m in os.environ.get("MONITOR_MONTHS", "juni,juli,september").split(",")
     if m.strip()
 }
 
 STATE_FILE = os.environ.get("MONITOR_STATE_FILE", "veida_state.json")
 
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 veida-monitor/1.0"
-)
+# Set MONITOR_DEBUG=1 to print what was actually received (encoding, length, snippet).
+DEBUG = os.environ.get("MONITOR_DEBUG", "").strip() not in ("", "0", "false", "False")
 
+# Browser-identical headers. The Accept / User-Agent values are what get you past
+# the WAF (the server returns 415 without them); keep them as-is.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -65,10 +72,15 @@ HEADERS = {
         "image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "is,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate, br",   # 'br' requires: pip install brotli
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
+
+MONTHS = (
+    "januar", "februar", "mars", "april", "mai", "juni",
+    "juli", "agust", "september", "oktober", "november", "desember",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -90,32 +102,110 @@ def strip_accents(text: str) -> str:
 def fetch_html(url: str) -> str:
     resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
-    return resp.text
+    text = resp.text
+
+    if DEBUG:
+        print(f"[debug] status={resp.status_code} "
+              f"content-encoding={resp.headers.get('Content-Encoding')!r} "
+              f"len={len(text)}", file=sys.stderr)
+        print(f"[debug] first 300 chars: {text[:300]!r}", file=sys.stderr)
+
+    # Guard against undecoded Brotli: if real HTML never has a '<' in the first
+    # kilobyte, we almost certainly got compressed bytes back.
+    if "<" not in text[:1000]:
+        enc = (resp.headers.get("Content-Encoding") or "").lower()
+        if "br" in enc:
+            try:
+                import brotli  # pip install brotli
+                text = brotli.decompress(resp.content).decode(
+                    resp.encoding or "utf-8", "replace"
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Server returned Brotli-compressed content but the 'brotli' "
+                    "package isn't installed, so requests couldn't decode it. "
+                    "Fix with: pip install brotli  (or drop 'br' from "
+                    "HEADERS['Accept-Encoding'])."
+                ) from exc
+        else:
+            raise RuntimeError(
+                f"Response doesn't look like HTML (Content-Encoding="
+                f"{enc or 'none'!r}, len={len(text)}). First chars: {text[:200]!r}"
+            )
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# Row extraction
+# --------------------------------------------------------------------------- #
+def _availability(status: str):
+    """('1 á lager') -> (available=True, count=1); ('Ekki á lager') -> (False, 0)."""
+    status_norm = strip_accents(status)
+    available = ("lager" in status_norm) and ("ekki" not in status_norm)
+    m = re.search(r"(\d+)", status_norm)
+    count = int(m.group(1)) if (m and available) else 0
+    return available, count
+
+
+def _detect_month(*sources) -> str | None:
+    """Find the first month name in any of the given text blobs (e.g. name, slug)."""
+    blob = strip_accents(" ".join(s for s in sources if s))
+    for candidate in MONTHS:
+        if candidate in blob:
+            return candidate
+    return None
 
 
 def parse_rows(html: str):
     """
     Return a list of dicts, one per product row:
         {name, url, price, status, available, count, month}
-    Works against the standard <table> by reading its header cells, so it does not
-    depend on plugin-specific CSS classes.
+
+    Primary strategy: locate the table by its 'Vara'/'Staða' headers and read
+    columns by index. If that fails for any reason, fall back to scanning every
+    row that links to a /vara/ product page (robust to column reordering or a
+    layout change).
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Find the table that has a "Staða" (status) header.
+    # ---- primary: header-mapped table ------------------------------------- #
     target = None
     for table in soup.find_all("table"):
         header_cells = table.find_all(["th", "td"], limit=20)
-        header_text = strip_accents(" ".join(c.get_text(" ", strip=True) for c in header_cells))
+        header_text = strip_accents(
+            " ".join(c.get_text(" ", strip=True) for c in header_cells)
+        )
         if "stada" in header_text and "vara" in header_text:
             target = table
             break
-    if target is None:
-        raise RuntimeError("Could not locate the products table (no 'Staða'/'Vara' header found).")
 
-    # Build column-name -> index map from the header row.
+    if target is not None:
+        rows = _parse_table_by_header(target)
+        if rows:
+            return rows
+
+    # ---- fallback: anchor-based scan -------------------------------------- #
+    rows = _parse_by_product_links(soup)
+    if rows:
+        if DEBUG:
+            print("[debug] used anchor-based fallback parser", file=sys.stderr)
+        return rows
+
+    # ---- nothing worked: fail loudly and informatively -------------------- #
+    snippet = soup.get_text(" ", strip=True)[:300]
+    raise RuntimeError(
+        "Could not locate any product rows. "
+        f"Found {len(soup.find_all('table'))} table(s); "
+        f"page text starts: {snippet!r}"
+    )
+
+
+def _parse_table_by_header(target):
     header_row = target.find("tr")
-    headers = [strip_accents(th.get_text(" ", strip=True)) for th in header_row.find_all(["th", "td"])]
+    headers = [
+        strip_accents(th.get_text(" ", strip=True))
+        for th in header_row.find_all(["th", "td"])
+    ]
 
     def col(*candidates):
         for cand in candidates:
@@ -127,14 +217,17 @@ def parse_rows(html: str):
     idx_vara = col("vara")
     idx_verd = col("verd")
     idx_stada = col("stada")
-    idx_tag = col("product_tag", "tag")        # clean ASCII month slug, if present
-    idx_timabil = col("timabil")               # Icelandic month name column
+    idx_tag = col("product_tag", "tag")   # clean ASCII month slug, if present
+    idx_timabil = col("timabil")          # Icelandic month name column
+
+    if idx_vara is None:
+        return []
 
     rows = []
     body = target.find("tbody") or target
     for tr in body.find_all("tr"):
         cells = tr.find_all("td")
-        if not cells or idx_vara is None or idx_vara >= len(cells):
+        if not cells or idx_vara >= len(cells):
             continue  # header or empty row
 
         vara_cell = cells[idx_vara]
@@ -144,39 +237,54 @@ def parse_rows(html: str):
         link = vara_cell.find("a")
         prod_url = link["href"] if link and link.has_attr("href") else URL
 
-        status = cells[idx_stada].get_text(" ", strip=True) if idx_stada is not None and idx_stada < len(cells) else ""
-        price = cells[idx_verd].get_text(" ", strip=True) if idx_verd is not None and idx_verd < len(cells) else ""
+        def cell_text(idx):
+            return cells[idx].get_text(" ", strip=True) if idx is not None and idx < len(cells) else ""
 
-        # Availability: "N á lager" => available; "Ekki á lager" => sold out.
-        status_norm = strip_accents(status)
-        available = ("lager" in status_norm) and ("ekki" not in status_norm)
-        m = re.search(r"(\d+)", status_norm)
-        count = int(m.group(1)) if (m and available) else 0
+        status = cell_text(idx_stada)
+        price = cell_text(idx_verd)
+        available, count = _availability(status)
 
-        # Month detection: prefer the clean tag slug, then Tímabil, then the name.
-        month_sources = []
-        if idx_tag is not None and idx_tag < len(cells):
-            month_sources.append(cells[idx_tag].get_text(" ", strip=True))
-        if idx_timabil is not None and idx_timabil < len(cells):
-            month_sources.append(cells[idx_timabil].get_text(" ", strip=True))
-        month_sources.append(name)
-        month_blob = strip_accents(" ".join(month_sources))
-
-        month = None
-        for candidate in ("januar", "februar", "mars", "april", "mai", "juni",
-                           "juli", "agust", "september", "oktober", "november", "desember"):
-            if candidate in month_blob:
-                month = candidate
-                break
+        month = _detect_month(cell_text(idx_tag), cell_text(idx_timabil), name, prod_url)
 
         rows.append({
-            "name": name,
-            "url": prod_url,
-            "price": price,
-            "status": status,
-            "available": available,
-            "count": count,
-            "month": month,
+            "name": name, "url": prod_url, "price": price, "status": status,
+            "available": available, "count": count, "month": month,
+        })
+    return rows
+
+
+def _parse_by_product_links(soup):
+    """Layout-agnostic: any <tr> containing a link to /vara/ is a product row."""
+    rows = []
+    seen = set()
+    for tr in soup.find_all("tr"):
+        link = tr.find("a", href=re.compile(r"/vara/"))
+        if not link:
+            continue
+        prod_url = link.get("href", URL)
+        if prod_url in seen:
+            continue
+        seen.add(prod_url)
+
+        name = link.get_text(" ", strip=True)
+        row_text = tr.get_text(" ", strip=True)
+
+        # Status: the cell mentioning "lager"; price: the cell mentioning "kr".
+        status, price = "", ""
+        for td in tr.find_all("td"):
+            txt = td.get_text(" ", strip=True)
+            low = strip_accents(txt)
+            if "lager" in low and not status:
+                status = txt
+            elif "kr" in low and not price:
+                price = txt
+
+        available, count = _availability(status)
+        month = _detect_month(prod_url, name, row_text)
+
+        rows.append({
+            "name": name, "url": prod_url, "price": price, "status": status,
+            "available": available, "count": count, "month": month,
         })
     return rows
 
@@ -206,10 +314,10 @@ def save_state(keys):
 # Email notification
 # --------------------------------------------------------------------------- #
 def send_email(new_rows):
-    lines = ["Veidileyfi laust! (a fishing permit is available)\n"]
+    lines = ["Veidileyfi laust!\n"]
     for r in new_rows:
         lines.append(f"- {r['name']} - {r['status']} - {r['price']}\n  {r['url']}")
-    lines.append("\nBook here: " + URL)
+    lines.append("\nBóka hér: " + URL)
     body = "\n".join(lines)
 
     user = os.environ["SMTP_USER"]
